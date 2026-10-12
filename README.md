@@ -20,8 +20,6 @@ Hearts of Iron IV/
 3. 重启游戏。此 DLL 通过 LoadLibrary 自行延迟初始化，不需要 injector 调用自定义初始化导出。
 4. 检查同目录生成的 `Globe Map Fix.log`。成功时包含 `Installed: 5-byte projection CALL + 7-byte world-picker entry`。injector 日志中的 `loaded` 仅表示 DLL 已载入，不能代替此安装成功记录。
 
-成品只交付在工作目录，本次没有安装到实际游戏目录。
-
 ## 行为和范围
 
 - 两处挂钩，共改写 12 字节：通用地图图标路径中的 5 字节 CALL，以及地图世界坐标拾取入口的 7 字节。近地址跳板为 RX；安装时同时验证并写入两处，避免只安装其中一项。
