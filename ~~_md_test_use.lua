@@ -1,0 +1,10 @@
+
+NDefines_Graphics.NGraphics.DRAW_MAP_OBJECTS_CUTOFF = 100000
+
+NDefines_Graphics.NGraphics.UNITS_ICONS_DISTANCE_CUTOFF = 100000
+NDefines_Graphics.NGraphics.CAPITAL_ICON_CUTOFF = 100000
+NDefines_Graphics.NGraphics.NAVAL_COMBAT_DISTANCE_CUTOFF = 100000
+NDefines_Graphics.NGraphics.LAND_COMBAT_DISTANCE_CUTOFF = 100000
+
+NDefines_Graphics.NGraphics.UNITS_DISTANCE_CUTOFF = 100000
+NDefines_Graphics.NGraphics.SHIPS_DISTANCE_CUTOFF = 100000
