@@ -4,7 +4,7 @@
 
 ## 安装
 
-1. 已安装并启用 hoi4 mod injector：https://github.com/MyresMkG/HOI4-Mod-Injector/releases；在启动器的播放集中启用 Globe Mod：https://steamcommunity.com/sharedfiles/filedetails/?id=3816496697。
+1. 已安装并启用 hoi4 mod injector：https://github.com/MyresMkG/HOI4-Mod-Injector/releases ；在启动器的播放集中启用 Globe Mod：https://steamcommunity.com/sharedfiles/filedetails/?id=3816496697 。
 2. 把成品的 **Globe Map Fix 整个目录**放到游戏的 `injected_mods` 下，最终路径是：
 
 ```text
