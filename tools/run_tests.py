@@ -22,8 +22,13 @@ RESULTS = []
 
 
 def run(name, args, cwd=ROOT, timeout=90):
-    p = subprocess.run([str(a) for a in args], cwd=cwd, capture_output=True,
-                       text=True, errors='replace', timeout=timeout)
+    try:
+        p = subprocess.run([str(a) for a in args], cwd=cwd, capture_output=True,
+                           text=True, errors='replace', timeout=timeout)
+    except OSError as error:
+        RESULTS.append(dict(name=name, returncode=-1, stdout='', stderr=str(error)))
+        print(f'{name}: BLOCKED ({error})')
+        return False
     result = dict(name=name, returncode=p.returncode, stdout=p.stdout, stderr=p.stderr)
     RESULTS.append(result)
     print(f'{name}: {"PASS" if p.returncode == 0 else "FAIL"}')
@@ -92,6 +97,7 @@ def setup(name, mode, status, overrides=None):
     argument='injector' if mode.startswith('injector') else str(dll)
     extra=[]
     if mode=='command_userdir': extra=['-userdir='+str(user)]
+    if mode=='broken_ray': extra=['break_ray']
     if mode=='duplicate':
         second=case/'duplicate';second.mkdir(exist_ok=True)
         shutil.copy2(dll,second/dll.name);shutil.copy2(dll_dir/'Globe Map Fix.ini',second/'Globe Map Fix.ini')
@@ -115,10 +121,10 @@ def main():
     for name,mode,status in [('active','active',4),('command_userdir','command_userdir',4),('duplicate','duplicate',4),('inactive','inactive',1),
         ('wrong_shader','wrong_shader',2),('replace_path_masks_shader','mask_globe',1),
         ('terrain_override','override_terrain',2),('malformed_json','malformed',2),
-        ('disabled','disabled',5),('probe','probe',3),
+        ('disabled','disabled',5),('probe','probe',3),('broken_ray_refuses_both_hooks','broken_ray',2),
         ('real_injector','injector',4),('real_injector_probe','injector_probe',3)]:
         passed &= setup(name,mode,status)
-    summary=dict(schema='globe_map_fix.test_report.v1',passed=bool(passed),
+    summary=dict(schema='globe_map_fix.test_report.v1',version='1.1.0',passed=bool(passed),
         dll_sha256=hashlib.sha256((RELEASE/'Globe Map Fix.dll').read_bytes()).hexdigest(),
         real_game_tested=False,results=RESULTS)
     (BUILD/'test_report.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2)+'\n', encoding='utf-8')

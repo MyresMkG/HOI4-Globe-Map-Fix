@@ -8,6 +8,7 @@
 #include <random>
 #include <vector>
 #include "test_support.hpp"
+#include "../src/globe_pick.hpp"
 
 template<class T>struct Com {
     T* p=nullptr;~Com(){if(p)p->Release();}
@@ -57,6 +58,8 @@ RWStructuredBuffer<Result> Results:register(u0);
     if(!good(device->CreateBuffer(&desc,nullptr,uniform.addr()),"uniform"))return 12;
     context->CSSetShader(cs.p,nullptr,0);context->CSSetShaderResources(0,1,&srv.p);context->CSSetUnorderedAccessViews(0,1,&uav.p,nullptr);context->CSSetConstantBuffers(0,1,&uniform.p);
     gmf::Settings settings;double max_error=0,max_eye_error=0,max_pixel_error=0;unsigned comparisons=0,failures=0,visibility_failures=0,pixel_failures=0;
+    double max_inverse_pixel_error=0;unsigned inverse_checks=0,inverse_failures=0;
+    auto constant_height=[](void* p,float,float)->float {return *static_cast<float*>(p);};
     for(float camera_height:{800.f,999.f,1000.f,1000.1f,1002.f,1010.f,1020.f,1050.f,1100.f,1200.f,1399.f,1400.f,1500.f,1700.f,1799.f,1800.f,2000.f,2400.f}) {
         for(auto direction:{gmf::Vec3{0,-1,0.15f},gmf::Vec3{0.4f,-1,-0.2f},gmf::Vec3{-0.6f,-1,0.8f}}) {
             gmf::Vec3 eye{2800,camera_height,1200};auto matrix=perspective(eye,direction);auto view=gmf::prepare(matrix.data(),settings);
@@ -84,6 +87,22 @@ RWStructuredBuffer<Result> Results:register(u0);
                         if(a.x>=0&&a.x<=1920&&a.y>=0&&a.y<=1080) {
                             double pe=std::max(double(std::abs(a.x-b.x)),double(std::abs(a.y-b.y)));
                             max_pixel_error=std::max(max_pixel_error,pe);if(pe>0.25)++pixel_failures;
+                            if(view.blend>0&&points[i].p.y>=settings.water&&points[i].p.y<=25.5&&points[i].p.z>=0&&points[i].p.z<settings.height&&
+                               (view.mix==1||std::abs(points[i].p.x-view.focus_x)<settings.width*.5)) {
+                                auto delta=gmf::d3(p)-gmf::d3(view.eye);auto ray=delta*(1/std::sqrt(gmf::dot(delta,delta)));
+                                double facing=-(gpu[i].normal[0]*ray.x+gpu[i].normal[1]*ray.y+gpu[i].normal[2]*ray.z);
+                                if(facing>.15) {
+                                    gmf::Vec3 hit{};float altitude=points[i].p.y;++inverse_checks;
+                                    bool ok=gmf::pick(view.eye,{float(ray.x),float(ray.y),float(ray.z)},view,settings,constant_height,&altitude,hit);
+                                    if(ok) {
+                                        auto warped_hit=gmf::warp(hit,view,settings);gmf::Vec2 back;
+                                        project_reference(matrix.data(),&warped_hit.position,&back,viewport);
+                                        double error=std::max(double(std::abs(a.x-back.x)),double(std::abs(a.y-back.y)));
+                                        max_inverse_pixel_error=std::max(max_inverse_pixel_error,error);
+                                        if(error>.25)++inverse_failures;
+                                    }else ++inverse_failures;
+                                }
+                            }
                         }
                     }
                 }
@@ -93,5 +112,6 @@ RWStructuredBuffer<Result> Results:register(u0);
         }
     }
     std::cout<<"Actual HLSL/WARP comparisons="<<comparisons<<" max_world_error="<<max_error<<" max_eye_recovery_error="<<max_eye_error<<" max_visible_pixel_error="<<max_pixel_error<<" position_failures="<<failures<<" visibility_failures="<<visibility_failures<<" pixel_failures="<<pixel_failures<<'\n';
-    return failures||visibility_failures||pixel_failures?14:0;
+    std::cout<<"Actual HLSL inverse screen roundtrips="<<inverse_checks<<" max pixel error="<<max_inverse_pixel_error<<" failures="<<inverse_failures<<'\n';
+    return failures||visibility_failures||pixel_failures||inverse_failures||inverse_checks<1000?14:0;
 }

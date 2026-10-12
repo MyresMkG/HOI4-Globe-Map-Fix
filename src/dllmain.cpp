@@ -11,6 +11,7 @@
 #include <string>
 #include <vector>
 #include "globe_math.hpp"
+#include "globe_pick.hpp"
 #include "json.hpp"
 #include "locator.hpp"
 
@@ -21,6 +22,15 @@ volatile LONG g_status = 0; // pending, inactive, refused, probe, installed, dis
 gmf::Settings g_settings;
 using Project = float (*)(const float*, const gmf::Vec3*, gmf::Vec2*, const int*);
 Project g_original = nullptr;
+using Pick = gmf::Vec3* (*)(void*,gmf::Vec3*,const gmf::Vec2*,char);
+using Ray = void (*)(void*,const int*,float,gmf::Vec3*,gmf::Vec3*);
+using NativeHeight = float (*)(void*,float,float,char);
+Pick g_original_pick=nullptr;
+Ray g_ray=nullptr;
+NativeHeight g_height=nullptr;
+void** g_terrain=nullptr;
+void** g_active=nullptr;
+unsigned g_map_camera=0,g_primary_camera=0,g_matrix_offset=0;
 HANDLE g_log = INVALID_HANDLE_VALUE;
 
 std::wstring module_path(HMODULE m) {
@@ -200,7 +210,7 @@ bool settings(const std::wstring& game, const std::wstring& ini) {
         log("Refused: WATER_HEIGHT could not be read.");return false;
     }
     g_settings.water=std::stof(match[1]);
-    if(!std::isfinite(g_settings.water)||g_settings.water<0||g_settings.water>1000)return false;
+    if(!std::isfinite(g_settings.water)||g_settings.water<0||g_settings.water>25.5f)return false;
     auto bmp=effective(game,mods,L"map/provinces.bmp");
     HANDLE f=CreateFileW(bmp.c_str(),GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,0,nullptr);
     unsigned char header[54]{}; DWORD got=0;
@@ -232,6 +242,26 @@ float project(const float* matrix,const gmf::Vec3* point,gmf::Vec2* out,const in
        std::abs(out->x)>500000||std::abs(out->y)>500000) {*out={-1000000.0f,-1000000.0f};return 1.0f;}
     return depth;
 }
+float native_height(void* terrain,float x,float z) {return g_height(terrain,x,z,0);}
+gmf::Vec3* pick(void* map,gmf::Vec3* out,const gmf::Vec2* screen,char primary_only) {
+    if(!*g_active)return g_original_pick(map,out,screen,primary_only);
+    auto container=*reinterpret_cast<std::uint8_t**>(static_cast<std::uint8_t*>(map)+g_map_camera);
+    if(!container)return g_original_pick(map,out,screen,primary_only);
+    thread_local gmf::ViewCache cache;
+    const auto& view=cache.get(reinterpret_cast<const float*>(container+g_matrix_offset),g_settings);
+    if(!view.valid||view.blend==0)return g_original_pick(map,out,screen,primary_only);
+    gmf::Vec2 mouse;std::memcpy(&mouse,screen,sizeof(mouse));
+    *out={-32,0,-32}; // Native province bounds checks translate this to ID zero.
+    if(!std::isfinite(mouse.x)||!std::isfinite(mouse.y)||std::abs(mouse.x)>1000000||std::abs(mouse.y)>1000000)return out;
+    void* terrain=*g_terrain;if(!terrain)return out;
+    int pixel[2]={int(mouse.x),int(mouse.y)};
+    gmf::Vec3 ray{},eye{};
+    g_ray(container+g_primary_camera,pixel,0,&ray,&eye);
+    if(!gmf::finite(eye)||std::abs(eye.x-view.eye.x)>.1f||std::abs(eye.y-view.eye.y)>.1f||std::abs(eye.z-view.eye.z)>.1f)return out;
+    gmf::Vec3 result;
+    if(gmf::pick(eye,ray,view,g_settings,native_height,terrain,result))*out=result;
+    return out;
+}
 bool text_section(HMODULE module,std::uint8_t*& text,std::size_t& size) {
     auto base=reinterpret_cast<std::uint8_t*>(module);
     auto dos=reinterpret_cast<IMAGE_DOS_HEADER*>(base);
@@ -261,7 +291,9 @@ void* near_page(std::uint8_t* call) {
     }
     return nullptr;
 }
-bool patch_call(std::uint8_t* call,const std::uint8_t* expected,const std::uint8_t* replacement) {
+struct Patch {std::uint8_t* address;std::size_t size;std::uint8_t expected[7]{},replacement[7]{};DWORD protection=0;};
+bool patch_all(Patch* patches,std::size_t total) {
+    if(!total||total>2)return false;
     // Collect/open all handles before suspending anyone: no CRT allocation or
     // logging is done while another thread could own a heap/stdio lock.
     HANDLE threads[4096]{};std::size_t count=0;bool ok=true;
@@ -283,21 +315,42 @@ bool patch_call(std::uint8_t* call,const std::uint8_t* expected,const std::uint8
         if(SuspendThread(threads[suspended])==DWORD(-1)) {ok=false;break;}
         CONTEXT context{};context.ContextFlags=CONTEXT_CONTROL;
         if(!GetThreadContext(threads[suspended],&context)) {++suspended;ok=false;break;}
-        auto ip=context.Rip, start=reinterpret_cast<DWORD64>(call);
-        if(ip>=start && ip<start+5) {++suspended;ok=false;break;}
+        auto ip=context.Rip;
+        for(std::size_t j=0;j<total;++j) {
+            auto start=reinterpret_cast<DWORD64>(patches[j].address);
+            if(ip>=start&&ip<start+patches[j].size)ok=false;
+        }
+        if(!ok) {++suspended;break;}
     }
-    DWORD old=0;
-    if(ok && std::memcmp(call,expected,5)!=0)ok=false;
+    for(std::size_t i=0;ok&&i<total;++i)
+        if(std::memcmp(patches[i].address,patches[i].expected,patches[i].size)!=0)ok=false;
+    std::size_t writable=0;
     if(ok) {
-        ok=VirtualProtect(call,5,PAGE_EXECUTE_READWRITE,&old)!=FALSE;
-        if(ok) {
-            std::memcpy(call,replacement,5);
-            FlushInstructionCache(GetCurrentProcess(),call,5);
-            DWORD ignored=0;
-            if(!VirtualProtect(call,5,old,&ignored)) {
-                // Roll back before resuming if protection restoration fails.
-                std::memcpy(call,expected,5);FlushInstructionCache(GetCurrentProcess(),call,5);
-                VirtualProtect(call,5,old,&ignored);ok=false;
+        for(;writable<total;++writable)
+            if(!VirtualProtect(patches[writable].address,patches[writable].size,PAGE_EXECUTE_READWRITE,&patches[writable].protection)) {ok=false;break;}
+        if(ok)for(std::size_t i=0;i<total;++i) {
+            std::memcpy(patches[i].address,patches[i].replacement,patches[i].size);
+            FlushInstructionCache(GetCurrentProcess(),patches[i].address,patches[i].size);
+        }
+        for(std::size_t i=writable;i>0;--i) {
+            auto& p=patches[i-1];DWORD ignored=0;
+            if(!VirtualProtect(p.address,p.size,p.protection,&ignored))ok=false;
+        }
+        if(!ok&&writable==total) {
+            // Reopen all regions before rollback, then restore in reverse
+            // order. Two fixture hooks can share one protection page.
+            bool opened[2]{};
+            for(std::size_t i=0;i<total;++i) {
+                DWORD ignored=0;auto& p=patches[i];
+                opened[i]=VirtualProtect(p.address,p.size,PAGE_EXECUTE_READWRITE,&ignored)!=FALSE;
+            }
+            for(std::size_t i=0;i<total;++i)if(opened[i]) {
+                auto& p=patches[i];
+                std::memcpy(p.address,p.expected,p.size);FlushInstructionCache(GetCurrentProcess(),p.address,p.size);
+            }
+            for(std::size_t i=total;i>0;--i)if(opened[i-1]) {
+                auto& p=patches[i-1];DWORD ignored=0;
+                VirtualProtect(p.address,p.size,p.protection,&ignored);
             }
         }
     }
@@ -308,7 +361,7 @@ bool patch_call(std::uint8_t* call,const std::uint8_t* expected,const std::uint8
 void initialize() {
     auto dll=module_path(g_self), dir=parent(dll), exe=module_path(nullptr), game=parent(exe);
     g_log=CreateFileW(join(dir,L"Globe Map Fix.log").c_str(),GENERIC_WRITE,FILE_SHARE_READ,nullptr,CREATE_ALWAYS,0,nullptr);
-    log("Globe Map Fix 1.0.0 - CPU map-icon anchor projection");
+    log("Globe Map Fix 1.1.0 - CPU icons, hemisphere occlusion and inverse map picking");
     std::wstring name=exe.substr(exe.find_last_of(L"\\/")+1);
     if(_wcsicmp(name.c_str(),L"hoi4.exe")!=0) {log("Inactive: host is not hoi4.exe.");InterlockedExchange(&g_status,1);return;}
     auto ini=join(dir,L"Globe Map Fix.ini");
@@ -319,36 +372,86 @@ void initialize() {
     auto location=gmf::locate(text,length);
     if(location.matches!=1) {log("Refused: projection call candidates = %d (exactly one required).",location.matches);InterlockedExchange(&g_status,2);return;}
     auto call=text+location.call;g_original=reinterpret_cast<Project>(text+location.projection);
+    auto picking=gmf::locate_pick(text,length);
+    if(picking.matches!=1||picking.height_matches!=1||location.matrix_offset<64||location.matrix_offset>4096||
+       unsigned(location.matrix_offset)<=picking.primary_camera) {
+        log("Refused: picking contracts/camera offsets are unsupported (pick=%d height=%d).",picking.matches,picking.height_matches);
+        InterlockedExchange(&g_status,2);return;
+    }
+    auto pick_entry=text+picking.entry;
+    auto base=reinterpret_cast<std::uint8_t*>(GetModuleHandleW(nullptr));
+    auto nt=reinterpret_cast<IMAGE_NT_HEADERS64*>(base+reinterpret_cast<IMAGE_DOS_HEADER*>(base)->e_lfanew);
+    std::intptr_t cells[2]={reinterpret_cast<std::intptr_t>(text)+picking.terrain_cell,
+                           reinterpret_cast<std::intptr_t>(text)+picking.active_cell};
+    for(auto cell:cells) {
+        MEMORY_BASIC_INFORMATION mb{};
+        if(cell<reinterpret_cast<std::intptr_t>(base)||cell+8>reinterpret_cast<std::intptr_t>(base)+nt->OptionalHeader.SizeOfImage||
+           VirtualQuery(reinterpret_cast<void*>(cell),&mb,sizeof(mb))!=sizeof(mb)||mb.State!=MEM_COMMIT||
+           (mb.Protect&(PAGE_NOACCESS|PAGE_GUARD))||cell+8>reinterpret_cast<std::intptr_t>(mb.BaseAddress)+std::intptr_t(mb.RegionSize)) {
+            log("Refused: picker globals are outside the readable host image.");InterlockedExchange(&g_status,2);return;
+        }
+    }
+    g_terrain=reinterpret_cast<void**>(cells[0]);g_active=reinterpret_cast<void**>(cells[1]);g_map_camera=picking.map_camera;
+    g_primary_camera=picking.primary_camera;g_matrix_offset=unsigned(location.matrix_offset);
+    g_ray=reinterpret_cast<Ray>(text+picking.ray);g_height=reinterpret_cast<NativeHeight>(text+picking.height);
     std::uint8_t original[5];std::memcpy(original,call,5);
     std::int32_t original_disp;std::memcpy(&original_disp,original+1,4);
     if(original[0]!=0xe8 || call+5+original_disp!=text+location.projection) {
         log("Refused: the call changed during signature verification.");InterlockedExchange(&g_status,2);return;
     }
-    auto base=reinterpret_cast<std::uint8_t*>(GetModuleHandleW(nullptr));
     log("Located call RVA 0x%llx; original projection RVA 0x%llx.",
         static_cast<unsigned long long>(call-base),static_cast<unsigned long long>(text+location.projection-base));
+    log("Located pick RVA 0x%llx, ray RVA 0x%llx, height RVA 0x%llx; decoded camera offsets 0x%x/0x%x/0x%x.",
+        static_cast<unsigned long long>(pick_entry-base),static_cast<unsigned long long>(text+picking.ray-base),
+        static_cast<unsigned long long>(text+picking.height-base),g_map_camera,g_primary_camera,g_matrix_offset);
     if(GetPrivateProfileIntW(L"fix",L"probe",0,ini.c_str())!=0 || regular(join(dir,L"diplo_action_hook_probe_only.txt"))) {
         log("Probe only: no memory modification.");InterlockedExchange(&g_status,3);return;
     }
-    void* page=near_page(call);
-    if(!page) {log("Refused: no executable relay page within rel32 range.");InterlockedExchange(&g_status,2);return;}
+    void* page=near_page(call),*pick_page=near_page(pick_entry);
+    if(!page||!pick_page) {
+        if(page)VirtualFree(page,0,MEM_RELEASE);
+        if(pick_page)VirtualFree(pick_page,0,MEM_RELEASE);
+        log("Refused: no executable relay page within rel32 range.");InterlockedExchange(&g_status,2);return;
+    }
     auto relay=static_cast<std::uint8_t*>(page);
     const std::uint8_t jump[6]={0xff,0x25,0,0,0,0};std::memcpy(relay,jump,6);
     auto destination=reinterpret_cast<std::uintptr_t>(&project);std::memcpy(relay+6,&destination,8);
+    auto trampoline=static_cast<std::uint8_t*>(pick_page);
+    std::memcpy(trampoline,pick_entry,7);std::memcpy(trampoline+7,jump,6);
+    auto back=reinterpret_cast<std::uintptr_t>(pick_entry+7);std::memcpy(trampoline+13,&back,8);
+    auto pick_relay=trampoline+32;std::memcpy(pick_relay,jump,6);
+    destination=reinterpret_cast<std::uintptr_t>(&pick);std::memcpy(pick_relay+6,&destination,8);
+    g_original_pick=reinterpret_cast<Pick>(trampoline);
     DWORD old=0;
-    if(!VirtualProtect(page,4096,PAGE_EXECUTE_READ,&old)) {VirtualFree(page,0,MEM_RELEASE);InterlockedExchange(&g_status,2);return;}
+    if(!VirtualProtect(page,4096,PAGE_EXECUTE_READ,&old)||!VirtualProtect(pick_page,4096,PAGE_EXECUTE_READ,&old)) {
+        VirtualFree(page,0,MEM_RELEASE);VirtualFree(pick_page,0,MEM_RELEASE);InterlockedExchange(&g_status,2);return;
+    }
     FlushInstructionCache(GetCurrentProcess(),relay,14);
+    FlushInstructionCache(GetCurrentProcess(),trampoline,46);
     auto distance=reinterpret_cast<std::intptr_t>(relay)-reinterpret_cast<std::intptr_t>(call+5);
     if(distance<std::numeric_limits<std::int32_t>::min()||distance>std::numeric_limits<std::int32_t>::max()) {
-        VirtualFree(page,0,MEM_RELEASE);InterlockedExchange(&g_status,2);return;
+        VirtualFree(page,0,MEM_RELEASE);VirtualFree(pick_page,0,MEM_RELEASE);InterlockedExchange(&g_status,2);return;
     }
     std::uint8_t replacement[5]={0xe8,0,0,0,0};
     auto disp=static_cast<std::int32_t>(distance);std::memcpy(replacement+1,&disp,4);
+    Patch patches[2]={{call,5,{},{},0},{pick_entry,7,{},{},0}};
+    std::memcpy(patches[0].expected,original,5);std::memcpy(patches[0].replacement,replacement,5);
+    std::memcpy(patches[1].expected,pick_entry,7);
+    patches[1].replacement[0]=0xe9;patches[1].replacement[5]=0x90;patches[1].replacement[6]=0x90;
+    distance=reinterpret_cast<std::intptr_t>(pick_relay)-reinterpret_cast<std::intptr_t>(pick_entry+5);
+    if(distance<std::numeric_limits<std::int32_t>::min()||distance>std::numeric_limits<std::int32_t>::max()) {
+        VirtualFree(page,0,MEM_RELEASE);VirtualFree(pick_page,0,MEM_RELEASE);InterlockedExchange(&g_status,2);return;
+    }
+    disp=static_cast<std::int32_t>(distance);std::memcpy(patches[1].replacement+1,&disp,4);
     MemoryBarrier(); bool installed=false;
-    for(int attempt=0;attempt<8&&!installed;++attempt) {installed=patch_call(call,original,replacement);if(!installed)Sleep(10);}
-    if(!installed) {VirtualFree(page,0,MEM_RELEASE);log("Refused: threads/call bytes could not be safely quiesced.");InterlockedExchange(&g_status,2);return;}
-    log("Installed: one 5-byte call replaced; relay is RX; flat-view calls use the original projection.");
-    log("Back-side/out-of-map icons use an off-screen GUI anchor; map terrain picking is unchanged.");
+    for(int attempt=0;attempt<8&&!installed;++attempt) {installed=patch_all(patches,2);if(!installed)Sleep(10);}
+    if(!installed) {
+        // Retain tiny RX pages on refusal as well: even a protection API failure
+        // must never leave a branch pointing at freed memory.
+        log("Refused: threads/code bytes could not be safely quiesced.");InterlockedExchange(&g_status,2);return;
+    }
+    log("Installed: 5-byte projection CALL + 7-byte world-picker entry; both relays RX; flat paths unchanged.");
+    log("Back-side icons and their GUI anchors are off-screen; curved picking inverts GlobeWarp with live terrain height.");
     InterlockedExchange(&g_status,4);
 }
 void CALLBACK start(void*,BOOLEAN) {
