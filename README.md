@@ -2,6 +2,8 @@
 
 为 Globe Mod 修补 HOI4 的地图图标锚点投影。
 
+（使用gpt-6.1-sol，harness为codex）
+
 ## 安装
 
 1. 已安装并启用 hoi4 mod injector：https://github.com/MyresMkG/HOI4-Mod-Injector/releases ；在启动器的播放集中启用 Globe Mod：https://steamcommunity.com/sharedfiles/filedetails/?id=3816496697 。
