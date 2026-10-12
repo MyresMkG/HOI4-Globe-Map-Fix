@@ -1,6 +1,6 @@
 # HOI4 Globe Map Fix
 
-为 Globe Mod 0.2.0 修补 HOI4 的 CPU 地图图标锚点投影。
+为 Globe Mod 修补 HOI4 的地图图标锚点投影。
 
 ## 安装
 
