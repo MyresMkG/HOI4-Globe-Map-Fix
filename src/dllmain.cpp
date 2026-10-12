@@ -18,7 +18,7 @@
 namespace {
 HMODULE g_self;
 HANDLE g_timer;
-volatile LONG g_status = 0; // pending, inactive, refused, probe, installed, disabled
+volatile LONG g_status = 0; // 0..5 legacy; 6 committed/degraded; 7 protection failure before commit
 gmf::Settings g_settings;
 using Project = float (*)(const float*, const gmf::Vec3*, gmf::Vec2*, const int*);
 Project g_original = nullptr;
@@ -94,6 +94,14 @@ std::string compact(const std::string& s) {
             i=s.find('\n', i+2); if (i==s.npos) break;
         } else if (s[i]=='/' && i+1<s.size() && s[i+1]=='*') {
             auto end=s.find("*/", i+2); if (end==s.npos) return {}; i=end+2;
+        } else if(s[i]=='"') {
+            out+=s[i++];bool closed=false;
+            while(i<s.size()) {
+                char c=s[i++];out+=c;
+                if(c=='\\'&&i<s.size())out+=s[i++];
+                else if(c=='"'){closed=true;break;}
+            }
+            if(!closed)return {};
         } else {
             unsigned char c=s[i++];
             if (c!=' ' && c!='\t' && c!='\r' && c!='\n') out+=char(c);
@@ -111,10 +119,18 @@ bool shader_contract(const std::string& s) {
     // contract, not a game-version pin; changed math requires a reviewed port.
     return hash==0x546da19246da7752ull;
 }
+bool terrain_shader_contract(const std::string& s) {
+    auto c=compact(s);if(c.empty())return false;
+    std::uint64_t hash=14695981039346656037ull;
+    for(unsigned char ch:c)hash=(hash^ch)*1099511628211ull;
+    // Includes, actual vertex code, preprocessor branches and effect bindings
+    // are all covered. Comment-only references or an unused helper cannot
+    // enable hooks. Pixel-code edits need revalidation of this contract too.
+    return hash==0x13c6d288c889e587ull;
+}
 std::wstring user_directory(const std::wstring& game, const std::wstring& ini) {
     wchar_t custom[32768]{};
     GetPrivateProfileStringW(L"fix", L"user_data_dir", L"", custom, 32768, ini.c_str());
-    if (*custom) return full_path(custom);
     int count=0; wchar_t** args=CommandLineToArgvW(GetCommandLineW(), &count);
     std::wstring result;
     if (args) {
@@ -126,7 +142,8 @@ std::wstring user_directory(const std::wstring& game, const std::wstring& ini) {
             if (a==L"-mod" || a.compare(0,5,L"-mod=")==0) { LocalFree(args); return {}; }
         }
         LocalFree(args);
-    }
+    }else return {};
+    if (*custom) return full_path(custom);
     if (!result.empty()) return full_path(absolute(result)?result:join(game,result));
     std::string userdir;
     if (regular(join(game,L"userdir.txt"))) {
@@ -199,9 +216,8 @@ bool settings(const std::wstring& game, const std::wstring& ini) {
         log("Refused: globe.fxh does not match the supported Globe Mod 0.2.0 transform.");return false;
     }
     std::string map_shader;
-    if(!read(effective(game,mods,L"gfx/FX/pdxmap.shader"),map_shader) ||
-       map_shader.find("\"globe.fxh\"")==map_shader.npos || map_shader.find("GlobeWarp(")==map_shader.npos) {
-        log("Refused: the active terrain shader does not use GlobeWarp.");return false;
+    if(!read(effective(game,mods,L"gfx/FX/pdxmap.shader"),map_shader) ||!terrain_shader_contract(map_shader)) {
+        log("Refused: the active terrain shader does not match the verified Globe Mod 0.2.0 pipeline.");return false;
     }
     std::string constants;
     if(!read(effective(game,mods,L"gfx/FX/constants.fxh"),constants))return false;
@@ -292,13 +308,27 @@ void* near_page(std::uint8_t* call) {
     return nullptr;
 }
 struct Patch {std::uint8_t* address;std::size_t size;std::uint8_t expected[7]{},replacement[7]{};DWORD protection=0;};
-bool patch_all(Patch* patches,std::size_t total) {
-    if(!total||total>2)return false;
+enum class PatchResult {retryable,installed,degraded,protection_failure};
+bool restore_protection(Patch* patches,std::size_t total) {
+    for(int attempt=0;attempt<3;++attempt) {
+        bool ok=true;
+        for(std::size_t i=total;i>0;--i) {
+            auto& p=patches[i-1];DWORD ignored=0;
+            if(!VirtualProtect(p.address,p.size,p.protection,&ignored))ok=false;
+            MEMORY_BASIC_INFORMATION mb{};
+            if(VirtualQuery(p.address,&mb,sizeof(mb))!=sizeof(mb)||mb.Protect!=p.protection)ok=false;
+        }
+        if(ok)return true;
+    }
+    return false;
+}
+PatchResult patch_all(Patch* patches,std::size_t total) {
+    if(!total||total>2)return PatchResult::retryable;
     // Collect/open all handles before suspending anyone: no CRT allocation or
     // logging is done while another thread could own a heap/stdio lock.
     HANDLE threads[4096]{};std::size_t count=0;bool ok=true;
     HANDLE snapshot=CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD,0);
-    if(snapshot==INVALID_HANDLE_VALUE)return false;
+    if(snapshot==INVALID_HANDLE_VALUE)return PatchResult::retryable;
     THREADENTRY32 e{};e.dwSize=sizeof(e);
     if(!Thread32First(snapshot,&e))ok=false;
     else do {
@@ -324,44 +354,47 @@ bool patch_all(Patch* patches,std::size_t total) {
     }
     for(std::size_t i=0;ok&&i<total;++i)
         if(std::memcmp(patches[i].address,patches[i].expected,patches[i].size)!=0)ok=false;
+    PatchResult result=PatchResult::retryable;
+    // Snapshot every original protection before opening either range. Shared
+    // pages must not record the first range's temporary RWX as their baseline.
+    for(std::size_t i=0;ok&&i<total;++i) {
+        auto& p=patches[i];MEMORY_BASIC_INFORMATION mb{};
+        if(VirtualQuery(p.address,&mb,sizeof(mb))!=sizeof(mb)||mb.State!=MEM_COMMIT||
+           p.address+p.size>static_cast<std::uint8_t*>(mb.BaseAddress)+mb.RegionSize)ok=false;
+        else p.protection=mb.Protect;
+    }
     std::size_t writable=0;
     if(ok) {
-        for(;writable<total;++writable)
-            if(!VirtualProtect(patches[writable].address,patches[writable].size,PAGE_EXECUTE_READWRITE,&patches[writable].protection)) {ok=false;break;}
-        if(ok)for(std::size_t i=0;i<total;++i) {
-            std::memcpy(patches[i].address,patches[i].replacement,patches[i].size);
-            FlushInstructionCache(GetCurrentProcess(),patches[i].address,patches[i].size);
+        for(;writable<total;++writable) {
+            DWORD ignored=0;auto& p=patches[writable];
+            if(!VirtualProtect(p.address,p.size,PAGE_EXECUTE_READWRITE,&ignored))break;
         }
-        for(std::size_t i=writable;i>0;--i) {
-            auto& p=patches[i-1];DWORD ignored=0;
-            if(!VirtualProtect(p.address,p.size,p.protection,&ignored))ok=false;
-        }
-        if(!ok&&writable==total) {
-            // Reopen all regions before rollback, then restore in reverse
-            // order. Two fixture hooks can share one protection page.
-            bool opened[2]{};
+        if(writable==total) {
+            // Commit both ranges while threads are stopped. Once committed,
+            // protection failure never triggers a partial byte rollback.
+            for(std::size_t i=0;i<total;++i)
+                std::memcpy(patches[i].address,patches[i].replacement,patches[i].size);
+            bool flushed=true;
             for(std::size_t i=0;i<total;++i) {
-                DWORD ignored=0;auto& p=patches[i];
-                opened[i]=VirtualProtect(p.address,p.size,PAGE_EXECUTE_READWRITE,&ignored)!=FALSE;
+                auto& p=patches[i];bool done=false;
+                for(int attempt=0;attempt<3&&!done;++attempt)
+                    done=FlushInstructionCache(GetCurrentProcess(),p.address,p.size)!=FALSE;
+                flushed=flushed&&done;
             }
-            for(std::size_t i=0;i<total;++i)if(opened[i]) {
-                auto& p=patches[i];
-                std::memcpy(p.address,p.expected,p.size);FlushInstructionCache(GetCurrentProcess(),p.address,p.size);
-            }
-            for(std::size_t i=total;i>0;--i)if(opened[i-1]) {
-                auto& p=patches[i-1];DWORD ignored=0;
-                VirtualProtect(p.address,p.size,p.protection,&ignored);
-            }
-        }
+            bool restored=restore_protection(patches,total);
+            for(std::size_t i=0;i<total;++i)
+                if(std::memcmp(patches[i].address,patches[i].replacement,patches[i].size)!=0)restored=false;
+            result=restored&&flushed?PatchResult::installed:PatchResult::degraded;
+        }else if(!restore_protection(patches,writable))result=PatchResult::protection_failure;
     }
     for(std::size_t i=0;i<suspended;++i)ResumeThread(threads[i]);
     for(std::size_t i=0;i<count;++i)CloseHandle(threads[i]);
-    return ok;
+    return result;
 }
 void initialize() {
     auto dll=module_path(g_self), dir=parent(dll), exe=module_path(nullptr), game=parent(exe);
     g_log=CreateFileW(join(dir,L"Globe Map Fix.log").c_str(),GENERIC_WRITE,FILE_SHARE_READ,nullptr,CREATE_ALWAYS,0,nullptr);
-    log("Globe Map Fix 1.1.0 - CPU icons, hemisphere occlusion and inverse map picking");
+    log("Globe Map Fix 1.1.1 - CPU icons, hemisphere occlusion and inverse map picking");
     std::wstring name=exe.substr(exe.find_last_of(L"\\/")+1);
     if(_wcsicmp(name.c_str(),L"hoi4.exe")!=0) {log("Inactive: host is not hoi4.exe.");InterlockedExchange(&g_status,1);return;}
     auto ini=join(dir,L"Globe Map Fix.ini");
@@ -443,12 +476,21 @@ void initialize() {
         VirtualFree(page,0,MEM_RELEASE);VirtualFree(pick_page,0,MEM_RELEASE);InterlockedExchange(&g_status,2);return;
     }
     disp=static_cast<std::int32_t>(distance);std::memcpy(patches[1].replacement+1,&disp,4);
-    MemoryBarrier(); bool installed=false;
-    for(int attempt=0;attempt<8&&!installed;++attempt) {installed=patch_all(patches,2);if(!installed)Sleep(10);}
-    if(!installed) {
-        // Retain tiny RX pages on refusal as well: even a protection API failure
-        // must never leave a branch pointing at freed memory.
-        log("Refused: threads/code bytes could not be safely quiesced.");InterlockedExchange(&g_status,2);return;
+    MemoryBarrier();PatchResult result=PatchResult::retryable;
+    for(int attempt=0;attempt<8&&result==PatchResult::retryable;++attempt) {
+        result=patch_all(patches,2);if(result==PatchResult::retryable)Sleep(10);
+    }
+    if(result==PatchResult::retryable) {
+        log("Refused: threads/code bytes could not be safely quiesced; neither hook was written.");
+        InterlockedExchange(&g_status,2);return;
+    }
+    if(result==PatchResult::protection_failure) {
+        log("Protection failure before commit: neither hook was written; host page protection could not be restored.");
+        InterlockedExchange(&g_status,7);return;
+    }
+    if(result==PatchResult::degraded) {
+        log("Installed degraded: BOTH hooks committed; host protection or instruction-cache API failed after retries. Restart required.");
+        InterlockedExchange(&g_status,6);return;
     }
     log("Installed: 5-byte projection CALL + 7-byte world-picker entry; both relays RX; flat paths unchanged.");
     log("Back-side icons and their GUI anchors are off-screen; curved picking inverts GlobeWarp with live terrain height.");

@@ -25,7 +25,7 @@ def run(name, args, cwd=ROOT, timeout=90):
     try:
         p = subprocess.run([str(a) for a in args], cwd=cwd, capture_output=True,
                            text=True, errors='replace', timeout=timeout)
-    except OSError as error:
+    except (OSError, subprocess.TimeoutExpired) as error:
         RESULTS.append(dict(name=name, returncode=-1, stdout='', stderr=str(error)))
         print(f'{name}: BLOCKED ({error})')
         return False
@@ -70,11 +70,13 @@ def setup(name, mode, status, overrides=None):
     enabled = ['mod/globe.mod']
     (user/'mod'/'globe.mod').write_text('name="Globe Mod"\npath="'+MOD.as_posix()+'"\n', encoding='utf-8')
     if mode == 'inactive': enabled=[]
-    if mode in ('wrong_shader', 'mask_globe', 'override_terrain'):
+    if mode in ('wrong_shader', 'mask_globe', 'override_terrain', 'comment_only_terrain'):
         override = case/'override'
         (override/'gfx'/'FX').mkdir(parents=True, exist_ok=True)
         if mode == 'wrong_shader': (override/'gfx'/'FX'/'globe.fxh').write_text('Code [[ float3 GlobeWarp(float3 p) { return p; } ]]')
         if mode == 'override_terrain': (override/'gfx'/'FX'/'pdxmap.shader').write_text('Code [[ float3 Flat(float3 p) { return p; } ]]')
+        if mode == 'comment_only_terrain':
+            (override/'gfx'/'FX'/'pdxmap.shader').write_text('// "globe.fxh"\n// GlobeWarp(\nCode [[ float3 Flat(float3 p) { return p; } ]]')
         descriptor = 'path="'+override.as_posix()+'"\n'
         if mode == 'mask_globe': descriptor += 'replace_path="gfx/FX"\n'
         (user/'mod'/'override.mod').write_text(descriptor, encoding='utf-8')
@@ -98,6 +100,7 @@ def setup(name, mode, status, overrides=None):
     extra=[]
     if mode=='command_userdir': extra=['-userdir='+str(user)]
     if mode=='broken_ray': extra=['break_ray']
+    if mode=='cli_mod': extra=['-mod=mod/unresolved.mod']
     if mode=='duplicate':
         second=case/'duplicate';second.mkdir(exist_ok=True)
         shutil.copy2(dll,second/dll.name);shutil.copy2(dll_dir/'Globe Map Fix.ini',second/'Globe Map Fix.ini')
@@ -115,17 +118,26 @@ def main():
     passed = compile_test('unit_tests.exe', [ROOT/'tools'/'unit_tests.cpp'])
     passed &= compile_test('gpu_oracle.exe', [ROOT/'tools'/'gpu_oracle.cpp'], ['-municode','-ld3d11','-ld3dcompiler'])
     passed &= compile_test('hoi4.exe', [ROOT/'tools'/'integration_host.cpp', ROOT/'tools'/'fixture.S'], ['-municode','-ldxgi','-luuid','-luser32'])
+    passed &= compile_test('pick_regressions.exe', [ROOT/'tools'/'pick_regressions.cpp'])
+    passed &= compile_test('native_regressions.exe', [ROOT/'tools'/'native_regressions.cpp'], ['-municode','-lshell32','-lole32','-luuid'])
+    passed &= compile_test('pick_bench.exe', [ROOT/'tools'/'pick_bench.cpp'])
     if not passed: return 1
     passed &= run('unit + installed exe signatures', [BUILD/'unit_tests.exe', EXE])
     passed &= run('actual HLSL GPU oracle', [BUILD/'gpu_oracle.exe', MOD/'gfx'/'FX'/'globe.fxh'])
+    passed &= run('nearest terrain, endpoints and latitude regressions', [BUILD/'pick_regressions.exe'])
+    passed &= run('terrain contract and patch API faults', [BUILD/'native_regressions.exe', MOD/'gfx'/'FX'/'pdxmap.shader'])
+    passed &= run('transition performance', [BUILD/'pick_bench.exe'])
     for name,mode,status in [('active','active',4),('command_userdir','command_userdir',4),('duplicate','duplicate',4),('inactive','inactive',1),
         ('wrong_shader','wrong_shader',2),('replace_path_masks_shader','mask_globe',1),
         ('terrain_override','override_terrain',2),('malformed_json','malformed',2),
+        ('comment_only_terrain_rejected','comment_only_terrain',2),('ini_with_cli_mod_rejected','cli_mod',2),
         ('disabled','disabled',5),('probe','probe',3),('broken_ray_refuses_both_hooks','broken_ray',2),
         ('real_injector','injector',4),('real_injector_probe','injector_probe',3)]:
         passed &= setup(name,mode,status)
-    summary=dict(schema='globe_map_fix.test_report.v1',version='1.1.0',passed=bool(passed),
+    summary=dict(schema='globe_map_fix.test_report.v1',version='1.1.1',passed=bool(passed),
         dll_sha256=hashlib.sha256((RELEASE/'Globe Map Fix.dll').read_bytes()).hexdigest(),
+        source_sha256={str(p.relative_to(ROOT)):hashlib.sha256(p.read_bytes()).hexdigest()
+                       for p in sorted((ROOT/'src').iterdir()) if p.is_file()},
         real_game_tested=False,results=RESULTS)
     (BUILD/'test_report.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2)+'\n', encoding='utf-8')
     return 0 if passed else 1

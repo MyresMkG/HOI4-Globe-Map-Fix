@@ -16,6 +16,9 @@ inline float latitude(float row, const Settings& s, float radius) {
     float p = (std::clamp(row, 0.0f, s.height) - (672.0f / 2048.0f) * s.height) / radius;
     return 2.5f * std::atan(std::exp(0.8f * p)) - 0.625f * 3.14159265f;
 }
+inline double latitude_precise(double row, const Settings& s, double radius) {
+    return 2.5*std::atan(std::exp(.8*(std::clamp(row,0.0,double(s.height))-(672.0/2048)*s.height)/radius))-.625*3.14159265;
+}
 
 // Clip X, Y and W are all zero at the eye of a perspective camera.
 // Solving those three planes avoids reading any version-specific camera fields.
@@ -50,6 +53,8 @@ struct View {
     float focus_x = 0, focus_z = 0, radius_full = 0, radius = 0;
     float blend = 0, scale = 0, geo = 0, mix = 0;
     float focus_lat = 0, sin_focus = 0, cos_focus = 1, row_lat = 0;
+    double chart_lower = 0, chart_upper = 0;
+    bool chart_valid = false;
     bool valid = false;
 };
 inline View prepare(const float* m, const Settings& s) {
@@ -71,6 +76,9 @@ inline View prepare(const float* m, const Settings& s) {
     v.focus_lat = v.row_lat * v.geo;
     v.sin_focus = std::sin(v.focus_lat);
     v.cos_focus = std::cos(v.focus_lat);
+    v.chart_lower=(1-v.geo)*(0-v.focus_z)/v.radius_full+v.geo*(latitude_precise(0,s,v.radius_full)-v.row_lat);
+    v.chart_upper=(1-v.geo)*(s.height-v.focus_z)/v.radius_full+v.geo*(latitude_precise(s.height,s,v.radius_full)-v.row_lat);
+    v.chart_valid=v.focus_lat+v.chart_lower*v.scale>-1.57079632&&v.focus_lat+v.chart_upper*v.scale<1.57079632;
     return v;
 }
 struct Warp { Vec3 position; bool visible; };
