@@ -20,8 +20,6 @@ Hearts of Iron IV/
 3. 重启游戏。此 DLL 通过 LoadLibrary 自行延迟初始化，不需要 injector 调用自定义初始化导出。
 4. 检查同目录生成的 `Globe Map Fix.log`。成功时包含 `Installed: one 5-byte call replaced`。injector 日志中的 `loaded` 仅表示 DLL 已载入，不能代替此安装成功记录。
 
-成品只交付在工作目录，本次没有安装到实际游戏目录。
-
 ## 行为和范围
 
 - 只替换通用地图图标路径中的一条 5 字节 CALL；原投影函数本体不改。近地址 RX 跳板转入修补函数，再调用原投影函数。
